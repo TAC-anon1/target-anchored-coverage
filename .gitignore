@@ -2,9 +2,6 @@ logs/
 *.log
 *.out
 *.err
-*.slurm
-*.sbatch
-slurm-*
 outputs/
 results/
 configs/generated/
