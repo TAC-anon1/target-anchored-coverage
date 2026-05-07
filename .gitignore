@@ -1,0 +1,16 @@
+logs/
+*.log
+*.out
+*.err
+*.slurm
+*.sbatch
+slurm-*
+outputs/
+results/
+configs/generated/
+configs/experiments/
+data/source_splits/
+data/target_splits/*/
+!data/target_splits/README.md
+__pycache__/
+*.pyc

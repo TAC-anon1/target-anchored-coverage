@@ -1,0 +1,22 @@
+{
+  "TCGA_LGG": {
+    "target_support_tag": "TAC",
+    "target_train_split": "data/target_splits/TCGA_LGG/tac_10",
+    "target_eval_split": "data/target_splits/TCGA_LGG/eval"
+  },
+  "C4": {
+    "target_support_tag": "TAC",
+    "target_train_split": "data/target_splits/C4/tac_10",
+    "target_eval_split": "data/target_splits/C4/eval"
+  },
+  "C5": {
+    "target_support_tag": "TAC",
+    "target_train_split": "data/target_splits/C5/tac_10",
+    "target_eval_split": "data/target_splits/C5/eval"
+  },
+  "TCGA_GBM": {
+    "target_support_tag": "TAC",
+    "target_train_split": "data/target_splits/TCGA_GBM/tac_10",
+    "target_eval_split": "data/target_splits/TCGA_GBM/eval"
+  }
+}

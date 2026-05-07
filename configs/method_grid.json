@@ -1,0 +1,6 @@
+{
+  "budgets": [50, 100, 150, 200],
+  "targets": ["TCGA_LGG", "C4", "C5", "TCGA_GBM"],
+  "target_methods": ["random1", "random2", "random3", "coreset", "lada", "aada", "ada_clue", "tac"],
+  "source_methods": ["target_only", "full_source", "random1", "random2", "random3", "coreset", "orient", "tac"]
+}

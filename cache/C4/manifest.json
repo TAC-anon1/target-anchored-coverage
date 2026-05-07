@@ -1,0 +1,18 @@
+{
+  "files": [
+    "cluster_subject_labels.npy",
+    "density_score.npy",
+    "distribution_match.npy",
+    "facility_align.npy",
+    "influence.npy",
+    "late_influence.npy",
+    "query_similarity.npy",
+    "reliability.npy",
+    "source_density.npy",
+    "source_embeddings_l2.npy",
+    "source_ids.txt",
+    "target_coverage_order.txt"
+  ],
+  "note": "TAC cache exported from fixed selection-time primitives; no downstream metric or reference subset membership is included.",
+  "target": "C4"
+}

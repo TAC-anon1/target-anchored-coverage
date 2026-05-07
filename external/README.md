@@ -1,0 +1,11 @@
+Place or symlink external dependencies here for the default reviewer workflow:
+
+- `EfficientVit/`: training code containing `scripts/train_seg.py`
+- `BraTS2021_preprocessed/`: preprocessed BraTS data root used by training configs
+- `selection_inputs/`: target candidate lists, validation/test lists, embeddings, and target scores.
+  Each target directory must contain `target_subject_ids.txt`,
+  `target_subject_vecs.npy`, `target_uncertainty.npy`,
+  `target_subject_fg_score.npy`, `lada_li_scores.npy`, `val_subjects.txt`, and
+  `test_subjects.txt`.
+
+Alternatively, set `EFFICIENTVIT_ROOT`, `BRATS_DATA_ROOT`, and `SPLIT_SOURCE_ROOT`.

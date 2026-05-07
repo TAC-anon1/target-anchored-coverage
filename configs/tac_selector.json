@@ -1,0 +1,21 @@
+{
+  "budget": 150,
+  "top_utility_pool": 500,
+  "top_signal_pool": 220,
+  "top_facility_pool": 250,
+  "gate_power": 4.0,
+  "gate_temperature": 0.05,
+  "sparse_rho0": 0.60,
+  "sparse_tau": 0.08,
+  "coverage_alignment0": 0.28,
+  "coverage_alignment_tau": 0.04,
+  "barrier_weight": 10.0,
+  "redundancy_lambda": 0.08,
+  "sparse_match_weight": 0.05,
+  "sparse_low_density_weight": 0.02,
+  "consensus_multi_quota": 45,
+  "consensus_facility_intercept": 50.0,
+  "consensus_facility_late_slope": 60.0,
+  "consensus_signal_intercept": 15.0,
+  "consensus_signal_late_slope": 30.0
+}
