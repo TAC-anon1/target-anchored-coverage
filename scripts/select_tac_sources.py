@@ -37,6 +37,10 @@ class TACConfig:
     top_utility_pool: int = 500
     top_signal_pool: int = 220
     top_facility_pool: int = 250
+    facility_backend: str = "auto"
+    facility_magnification_eta: float = 1.0
+    facility_stop_if_negative_gain: bool = False
+    facility_show_progress: bool = False
     gate_power: float = 4.0
     gate_temperature: float = 0.05
     sparse_rho0: float = 0.60
@@ -204,18 +208,17 @@ def compute_source_clusters(embeddings: np.ndarray, cluster_count: int = 32, see
     return model.fit_predict(embeddings).astype(np.int64)
 
 
-def greedy_target_facility_order(
-    embeddings: np.ndarray,
+def numpy_target_facility_order(
+    source_similarity: np.ndarray,
     query_similarity: np.ndarray,
     budget: int,
     redundancy_lambda: float,
 ) -> list[int]:
-    source_similarity = np.maximum(embeddings @ embeddings.T, 0.0).astype(np.float32)
     covered = np.zeros(query_similarity.shape[1], dtype=np.float32)
-    max_redundancy = np.zeros(embeddings.shape[0], dtype=np.float32)
+    max_redundancy = np.zeros(source_similarity.shape[0], dtype=np.float32)
     selected: list[int] = []
-    selected_mask = np.zeros(embeddings.shape[0], dtype=bool)
-    for _ in range(min(int(budget), embeddings.shape[0])):
+    selected_mask = np.zeros(source_similarity.shape[0], dtype=bool)
+    for _ in range(min(int(budget), source_similarity.shape[0])):
         gain = np.maximum(query_similarity, covered[None, :]).sum(axis=1) - covered.sum()
         value = gain - float(redundancy_lambda) * max_redundancy
         value[selected_mask] = -np.inf
@@ -227,6 +230,71 @@ def greedy_target_facility_order(
         covered = np.maximum(covered, query_similarity[idx])
         max_redundancy = np.maximum(max_redundancy, source_similarity[:, idx])
     return selected
+
+
+def submodlib_target_facility_order(
+    source_similarity: np.ndarray,
+    query_similarity: np.ndarray,
+    budget: int,
+    eta: float,
+    stop_if_negative_gain: bool,
+    show_progress: bool,
+) -> list[int]:
+    from submodlib.functions.facilityLocationMutualInformation import (  # type: ignore[import-not-found]
+        FacilityLocationMutualInformationFunction,
+    )
+
+    source_similarity = np.ascontiguousarray(source_similarity, dtype=np.float32)
+    query_similarity = np.ascontiguousarray(query_similarity, dtype=np.float32)
+    objective = FacilityLocationMutualInformationFunction(
+        n=source_similarity.shape[0],
+        num_queries=query_similarity.shape[1],
+        data_sijs=source_similarity,
+        query_sijs=query_similarity,
+        magnificationEta=float(eta),
+    )
+    result = objective.maximize(
+        budget=min(int(budget), source_similarity.shape[0]),
+        optimizer="LazyGreedy",
+        stopIfNegativeGain=bool(stop_if_negative_gain),
+        show_progress=bool(show_progress),
+    )
+    return [int(idx) for idx, _gain in result]
+
+
+def target_facility_order(
+    embeddings: np.ndarray,
+    query_similarity: np.ndarray,
+    config: TACConfig,
+) -> tuple[list[int], str]:
+    backend = str(config.facility_backend).lower()
+    if backend not in {"auto", "numpy", "submodlib"}:
+        raise ValueError(f"facility_backend must be one of auto, numpy, submodlib; got {config.facility_backend!r}")
+    source_similarity = np.maximum(embeddings @ embeddings.T, 0.0).astype(np.float32)
+    if backend in {"auto", "submodlib"}:
+        try:
+            order = submodlib_target_facility_order(
+                source_similarity=source_similarity,
+                query_similarity=query_similarity,
+                budget=config.top_facility_pool,
+                eta=config.facility_magnification_eta,
+                stop_if_negative_gain=config.facility_stop_if_negative_gain,
+                show_progress=config.facility_show_progress,
+            )
+            return order, "submodlib"
+        except (ImportError, ModuleNotFoundError) as exc:
+            if backend == "submodlib":
+                raise ImportError(
+                    "facility_backend='submodlib' requires the optional submodlib package. "
+                    "Install submodlib, or set facility_backend to 'auto' or 'numpy'."
+                ) from exc
+    order = numpy_target_facility_order(
+        source_similarity=source_similarity,
+        query_similarity=query_similarity,
+        budget=config.top_facility_pool,
+        redundancy_lambda=config.redundancy_lambda,
+    )
+    return order, "numpy"
 
 
 def facility_rank_score_from_indices(length: int, order: list[int]) -> np.ndarray:
@@ -256,11 +324,10 @@ def compute_target_conditioned_signals(
     match_raw = (query_similarity[np.arange(query_similarity.shape[0])[:, None], top_local] * row_weights).sum(axis=1)
     match = normalize(match_raw)
 
-    facility_order = greedy_target_facility_order(
+    facility_order, facility_backend = target_facility_order(
         embeddings,
         query_similarity,
-        budget=config.top_facility_pool,
-        redundancy_lambda=config.redundancy_lambda,
+        config=config,
     )
     facility = facility_rank_score_from_indices(len(source_ids), facility_order)
     if facility_order:
@@ -275,6 +342,7 @@ def compute_target_conditioned_signals(
         "M": match,
         "F": facility,
         "A": align,
+        "facility_backend": facility_backend,
     }
 
 
@@ -285,6 +353,11 @@ def load_config(path: Path, budget: int | None) -> TACConfig:
         config = replace(config, budget=int(budget))
     if config.budget <= 0:
         raise ValueError(f"budget must be positive, got {config.budget}")
+    if str(config.facility_backend).lower() not in {"auto", "numpy", "submodlib"}:
+        raise ValueError(
+            f"facility_backend must be one of auto, numpy, submodlib; got {config.facility_backend!r}"
+        )
+    config = replace(config, facility_backend=str(config.facility_backend).lower())
     return config
 
 
@@ -309,6 +382,7 @@ def load_arrays(
     match = target_signals["M"]
     facility = target_signals["F"]
     align = target_signals["A"]
+    facility_backend = target_signals["facility_backend"]
 
     expected = len(source_ids)
     for name, values in {
@@ -340,6 +414,7 @@ def load_arrays(
         "D": density,
         "F": facility,
         "A": align,
+        "facility_backend": facility_backend,
     }
 
 
@@ -382,6 +457,7 @@ def compute_diagnostics(arrays: dict[str, Any], config: TACConfig) -> dict[str, 
         "H": active_influence,
         "H_top": active_top,
         "F_top": facility_top,
+        "facility_backend": arrays["facility_backend"],
         "coverage_trust": coverage_trust,
         "facility_alignment": facility_alignment,
         "late_distinctness": float(late_distinctness),
@@ -650,8 +726,8 @@ def write_summary(rows: list[dict[str, Any]], results_root: Path, config: TACCon
         "",
         "## Selected Subsets",
         "",
-        "| Target | Selected | Sparse act. | Coverage act. | Consensus act. | R-top | H-top | F-top | Multi |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Target | Selected | Facility backend | Sparse act. | Coverage act. | Consensus act. | R-top | H-top | F-top | Multi |",
+        "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         diag = row["diagnostics"]
@@ -659,6 +735,7 @@ def write_summary(rows: list[dict[str, Any]], results_root: Path, config: TACCon
         counts = diag["selected_counts"]
         lines.append(
             f"| {row['target']} | {row['selected_total']} | "
+            f"{diag['facility_backend']} | "
             f"{acts['sparse']:.3f} | {acts['coverage']:.3f} | {acts['consensus']:.3f} | "
             f"{counts['reliability_top']} | {counts['influence_top']} | "
             f"{counts['facility_top']} | {counts['multi_signal']} |"
@@ -668,6 +745,7 @@ def write_summary(rows: list[dict[str, Any]], results_root: Path, config: TACCon
         "## Notes",
         "",
         "- The source-curation stage recomputes density, clustering, distribution-match, query-similarity, and target-coverage signals from source embeddings and the generated TAC target support.",
+        "- If `facility_backend` is `submodlib` or available through `auto`, target coverage uses FLMI greedy selection on freshly computed K/Q similarities; otherwise `auto` uses the deterministic NumPy facility-style fallback.",
         "- The source-curation stage does not read legacy reference splits, validation Dice, or test Dice.",
         "- Output source subsets are written under `data/source_splits/<target>/tac_<budget>/`.",
         "",
@@ -685,6 +763,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", choices=("all", *DEFAULT_TARGETS), default="all")
     parser.add_argument("--budget", type=int, default=None)
+    parser.add_argument(
+        "--facility-backend",
+        choices=("auto", "numpy", "submodlib"),
+        default=None,
+        help="Override the TAC coverage backend. 'submodlib' requires the optional submodlib package.",
+    )
     parser.add_argument("--selector-config", type=Path, default=ROOT / "configs/tac_selector.json")
     parser.add_argument("--cache-root", type=Path, default=ROOT / "cache")
     parser.add_argument("--data-root", type=Path, default=ROOT / "data/source_splits")
@@ -711,6 +795,8 @@ def main() -> None:
     if selector_config is None or cache_root is None or data_root is None:
         raise ValueError("selector_config, cache_root, and data_root are required")
     config = load_config(selector_config, args.budget)
+    if args.facility_backend is not None:
+        config = replace(config, facility_backend=args.facility_backend)
     results_root = arg_path(args.results_root, ROOT / "results/source_selection" / f"b{config.budget}")
     if results_root is None:
         raise ValueError("results_root is required")
