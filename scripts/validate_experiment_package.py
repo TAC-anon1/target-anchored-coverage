@@ -26,8 +26,6 @@ def read_ids(path: Path) -> list[str]:
 
 
 def pair_allowed(source_method: str, target_method: str, budget: int) -> bool:
-    if target_method in {"aada", "ada_clue"} and budget != 50:
-        return False
     if source_method == "tac":
         return target_method == "tac"
     if source_method == "orient" and target_method == "tac":

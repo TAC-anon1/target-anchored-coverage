@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Generate the TAC source-curation stage from frozen selection-time caches.
+"""Generate the TAC source-curation stage from primitive selection-time inputs.
 
 TAC means Target-Anchored Coverage for Source-Target Curation. The full TAC
 pipeline first selects a target support set, then uses that support as the
 anchor for source curation. This script implements the deterministic
-source-curation stage. It does not branch on target name, does not use
+source-curation stage. It recomputes target-conditioned source signals from the
+generated target support, does not branch on target name, does not use
 downstream Dice, and does not use reference subset membership.
 """
 
@@ -17,10 +18,17 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from sklearn.cluster import KMeans
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TARGETS = ("TCGA_LGG", "C4", "C5", "TCGA_GBM")
+TARGET_ACTIVE_DIR = {
+    "TCGA_LGG": "split_TCGA_LGG_active",
+    "C4": "split_C4_active",
+    "C5": "split_C5_active",
+    "TCGA_GBM": "split_TCGA_GBM_active",
+}
 
 
 @dataclass(frozen=True)
@@ -78,6 +86,11 @@ def top_set(values: np.ndarray, k: int) -> set[int]:
     return set(np.argsort(-values, kind="mergesort")[:k].tolist())
 
 
+def top_indices(values: np.ndarray, k: int) -> np.ndarray:
+    k = min(int(k), len(values))
+    return np.argsort(-values, kind="mergesort")[:k].astype(np.int64)
+
+
 def overlap_fraction(left: set[int], right: set[int]) -> float:
     return len(left & right) / max(1, min(len(left), len(right)))
 
@@ -115,6 +128,156 @@ def compute_reliability(cache_dir: Path, expected: int) -> np.ndarray:
     return normalize(score)
 
 
+def target_acquisition_weights(target_root: Path) -> tuple[list[str], np.ndarray, np.ndarray]:
+    ids = read_ids(target_root / "target_subject_ids.txt")
+    vectors = l2_normalize(np.load(target_root / "target_subject_vecs.npy").astype(np.float32))
+    if len(ids) != vectors.shape[0]:
+        raise ValueError(f"{target_root}: target_subject_ids and target_subject_vecs length mismatch")
+
+    def required_score(filename: str) -> np.ndarray:
+        path = target_root / filename
+        if not path.exists():
+            raise FileNotFoundError(f"missing target score file {path}")
+        values = np.load(path).astype(np.float32).reshape(-1)
+        if values.shape[0] != len(ids):
+            raise ValueError(f"{path}: length {values.shape[0]} != target ids length {len(ids)}")
+        return values
+
+    uncertainty = required_score("target_uncertainty.npy")
+    foreground = required_score("target_subject_fg_score.npy")
+    local_inconsistency = required_score("lada_li_scores.npy")
+    consistency = required_score("target_consistency.npy")
+    weights = (
+        normalize(uncertainty * foreground)
+        + 0.50 * normalize(local_inconsistency)
+        + 0.15 * normalize(consistency)
+    ).astype(np.float32)
+    return ids, vectors, weights
+
+
+def load_target_support(
+    split_source_root: Path,
+    target_split_root: Path,
+    target: str,
+) -> dict[str, Any]:
+    target_root = split_source_root / TARGET_ACTIVE_DIR[target]
+    selected_path = target_split_root / target / "tac_10" / "train_subjects.txt"
+    if not selected_path.exists():
+        raise FileNotFoundError(
+            f"{target}: missing TAC target support split {selected_path}. "
+            "Run scripts/generate_experiment_splits.py first, or provide --target-split-root."
+        )
+    all_ids, all_vectors, all_weights = target_acquisition_weights(target_root)
+    positions = {subject_id: idx for idx, subject_id in enumerate(all_ids)}
+    selected_ids = read_ids(selected_path)
+    missing = [subject_id for subject_id in selected_ids if subject_id not in positions]
+    if missing:
+        raise ValueError(f"{target}: selected target IDs missing from target state: {missing[:3]}")
+    selected_positions = np.asarray([positions[subject_id] for subject_id in selected_ids], dtype=np.int64)
+    return {
+        "ids": selected_ids,
+        "vectors": all_vectors[selected_positions],
+        "weights": all_weights[selected_positions],
+    }
+
+
+def compute_source_density(embeddings: np.ndarray, neighbors: int = 20) -> np.ndarray:
+    similarity = np.maximum(embeddings @ embeddings.T, 0.0).astype(np.float32)
+    np.fill_diagonal(similarity, -np.inf)
+    k = min(int(neighbors), max(1, similarity.shape[0] - 1))
+    top = np.partition(similarity, -k, axis=1)[:, -k:]
+    top[~np.isfinite(top)] = 0.0
+    return top.mean(axis=1).astype(np.float32)
+
+
+def compute_source_clusters(embeddings: np.ndarray, cluster_count: int = 32, seed: int = 2025) -> np.ndarray:
+    k = min(int(cluster_count), embeddings.shape[0])
+    if k <= 1:
+        return np.zeros(embeddings.shape[0], dtype=np.int64)
+    model = KMeans(
+        n_clusters=k,
+        init="k-means++",
+        n_init=10,
+        max_iter=300,
+        random_state=int(seed),
+    )
+    return model.fit_predict(embeddings).astype(np.int64)
+
+
+def greedy_target_facility_order(
+    embeddings: np.ndarray,
+    query_similarity: np.ndarray,
+    budget: int,
+    redundancy_lambda: float,
+) -> list[int]:
+    source_similarity = np.maximum(embeddings @ embeddings.T, 0.0).astype(np.float32)
+    covered = np.zeros(query_similarity.shape[1], dtype=np.float32)
+    max_redundancy = np.zeros(embeddings.shape[0], dtype=np.float32)
+    selected: list[int] = []
+    selected_mask = np.zeros(embeddings.shape[0], dtype=bool)
+    for _ in range(min(int(budget), embeddings.shape[0])):
+        gain = np.maximum(query_similarity, covered[None, :]).sum(axis=1) - covered.sum()
+        value = gain - float(redundancy_lambda) * max_redundancy
+        value[selected_mask] = -np.inf
+        idx = int(np.argmax(value))
+        if not np.isfinite(value[idx]):
+            break
+        selected.append(idx)
+        selected_mask[idx] = True
+        covered = np.maximum(covered, query_similarity[idx])
+        max_redundancy = np.maximum(max_redundancy, source_similarity[:, idx])
+    return selected
+
+
+def facility_rank_score_from_indices(length: int, order: list[int]) -> np.ndarray:
+    score = np.zeros(length, dtype=np.float32)
+    denom = max(1, len(order) - 1)
+    for rank, idx in enumerate(order):
+        score[int(idx)] = 1.0 - float(rank) / float(denom)
+    return score
+
+
+def compute_target_conditioned_signals(
+    source_ids: list[str],
+    embeddings: np.ndarray,
+    target_support: dict[str, Any],
+    config: TACConfig,
+) -> dict[str, np.ndarray]:
+    target_vectors = l2_normalize(target_support["vectors"])
+    target_weights = np.maximum(np.asarray(target_support["weights"], dtype=np.float32).reshape(-1), 1e-6)
+    if target_vectors.shape[0] != target_weights.shape[0]:
+        raise ValueError("target support vectors and weights length mismatch")
+    query_similarity = np.maximum(embeddings @ target_vectors.T, 0.0).astype(np.float32)
+
+    match_k = min(8, query_similarity.shape[1])
+    top_local = np.argsort(-query_similarity, axis=1, kind="mergesort")[:, :match_k]
+    row_weights = target_weights[top_local]
+    row_weights = row_weights / (row_weights.sum(axis=1, keepdims=True) + 1e-12)
+    match_raw = (query_similarity[np.arange(query_similarity.shape[0])[:, None], top_local] * row_weights).sum(axis=1)
+    match = normalize(match_raw)
+
+    facility_order = greedy_target_facility_order(
+        embeddings,
+        query_similarity,
+        budget=config.top_facility_pool,
+        redundancy_lambda=config.redundancy_lambda,
+    )
+    facility = facility_rank_score_from_indices(len(source_ids), facility_order)
+    if facility_order:
+        centroid = embeddings[np.asarray(facility_order, dtype=np.int64)].sum(axis=0, keepdims=True)
+        centroid = l2_normalize(centroid)[0]
+        align = normalize(np.maximum(embeddings @ centroid, 0.0))
+    else:
+        align = np.zeros(len(source_ids), dtype=np.float32)
+
+    return {
+        "Q": query_similarity,
+        "M": match,
+        "F": facility,
+        "A": align,
+    }
+
+
 def load_config(path: Path, budget: int | None) -> TACConfig:
     values = load_json(path)
     config = TACConfig(**values)
@@ -125,34 +288,27 @@ def load_config(path: Path, budget: int | None) -> TACConfig:
     return config
 
 
-def facility_rank_score(cache_dir: Path, source_ids: list[str]) -> np.ndarray:
-    order = read_ids(cache_dir / "target_coverage_order.txt")
-    positions = {subject_id: idx for idx, subject_id in enumerate(source_ids)}
-    score = np.zeros(len(source_ids), dtype=np.float32)
-    denom = max(1, len(order) - 1)
-    for rank, subject_id in enumerate(order):
-        idx = positions.get(subject_id)
-        if idx is not None:
-            score[idx] = 1.0 - float(rank) / float(denom)
-    return score
-
-
-def load_arrays(cache_root: Path, target: str) -> dict[str, Any]:
+def load_arrays(
+    cache_root: Path,
+    target: str,
+    config: TACConfig,
+    target_support: dict[str, Any],
+) -> dict[str, Any]:
     cache_dir = cache_root / target
     source_ids = read_ids(cache_dir / "source_ids.txt")
     embeddings = l2_normalize(np.load(cache_dir / "source_embeddings_l2.npy").astype(np.float32))
-    density_raw = np.load(cache_dir / "source_density.npy").astype(np.float32)
-    clusters = np.load(cache_dir / "cluster_subject_labels.npy").astype(np.int64)
-    query_similarity = np.maximum(np.load(cache_dir / "query_similarity.npy").astype(np.float32), 0.0)
+    density_raw = compute_source_density(embeddings)
+    clusters = compute_source_clusters(embeddings)
 
     reliability = compute_reliability(cache_dir, len(source_ids))
     influence = normalize(np.load(cache_dir / "influence.npy").astype(np.float32))
     late = normalize(np.load(cache_dir / "late_influence.npy").astype(np.float32))
-    match = normalize(np.load(cache_dir / "distribution_match.npy").astype(np.float32))
-    density = normalize(np.load(cache_dir / "density_score.npy").astype(np.float32))
-    facility = facility_rank_score(cache_dir, source_ids)
-
-    align = normalize(np.load(cache_dir / "facility_align.npy").astype(np.float32))
+    density = normalize(density_raw)
+    target_signals = compute_target_conditioned_signals(source_ids, embeddings, target_support, config)
+    query_similarity = target_signals["Q"]
+    match = target_signals["M"]
+    facility = target_signals["F"]
+    align = target_signals["A"]
 
     expected = len(source_ids)
     for name, values in {
@@ -434,8 +590,9 @@ def summarize_target(
     cache_root: Path,
     data_root: Path,
     results_root: Path,
+    target_support: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    arrays = load_arrays(cache_root, target)
+    arrays = load_arrays(cache_root, target, config=config, target_support=target_support)
     if config.budget > len(arrays["source_ids"]):
         raise ValueError(
             f"{target}: budget {config.budget} exceeds source pool size {len(arrays['source_ids'])}"
@@ -510,8 +667,8 @@ def write_summary(rows: list[dict[str, Any]], results_root: Path, config: TACCon
         "",
         "## Notes",
         "",
-        "- The source-curation stage reads only frozen target-conditioned signal caches.",
-        "- The source-curation stage does not read target identity-specific reference splits, validation Dice, or test Dice.",
+        "- The source-curation stage recomputes density, clustering, distribution-match, query-similarity, and target-coverage signals from source embeddings and the generated TAC target support.",
+        "- The source-curation stage does not read legacy reference splits, validation Dice, or test Dice.",
         "- Output source subsets are written under `data/source_splits/<target>/tac_<budget>/`.",
         "",
     ])
@@ -532,6 +689,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-root", type=Path, default=ROOT / "cache")
     parser.add_argument("--data-root", type=Path, default=ROOT / "data/source_splits")
     parser.add_argument("--results-root", type=Path, default=None)
+    parser.add_argument("--split-source-root", type=Path, default=ROOT / "external/selection_inputs")
+    parser.add_argument("--target-split-root", type=Path, default=ROOT / "data/target_splits")
     return parser.parse_args()
 
 
@@ -547,6 +706,8 @@ def main() -> None:
     selector_config = arg_path(args.selector_config)
     cache_root = arg_path(args.cache_root)
     data_root = arg_path(args.data_root)
+    split_source_root = arg_path(args.split_source_root)
+    target_split_root = arg_path(args.target_split_root)
     if selector_config is None or cache_root is None or data_root is None:
         raise ValueError("selector_config, cache_root, and data_root are required")
     config = load_config(selector_config, args.budget)
@@ -558,8 +719,12 @@ def main() -> None:
     if missing:
         raise FileNotFoundError(f"missing cache directories: {', '.join(missing)}")
     targets = target_names
+    target_supports = {
+        target: load_target_support(split_source_root, target_split_root, target)
+        for target in targets
+    }
     rows = [
-        summarize_target(target, config, cache_root, data_root, results_root)
+        summarize_target(target, config, cache_root, data_root, results_root, target_supports[target])
         for target in targets
     ]
     write_summary(rows, results_root, config)

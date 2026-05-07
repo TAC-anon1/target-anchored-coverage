@@ -5,7 +5,7 @@ Place or symlink external dependencies here for the default reviewer workflow:
 - `selection_inputs/`: target candidate lists, validation/test lists, embeddings, and target scores.
   Each target directory must contain `target_subject_ids.txt`,
   `target_subject_vecs.npy`, `target_uncertainty.npy`,
-  `target_subject_fg_score.npy`, `lada_li_scores.npy`, `val_subjects.txt`, and
-  `test_subjects.txt`.
+  `target_subject_fg_score.npy`, `lada_li_scores.npy`,
+  `target_consistency.npy`, `val_subjects.txt`, and `test_subjects.txt`.
 
 Alternatively, set `EFFICIENTVIT_ROOT`, `BRATS_DATA_ROOT`, and `SPLIT_SOURCE_ROOT`.

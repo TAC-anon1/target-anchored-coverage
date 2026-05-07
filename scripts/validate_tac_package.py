@@ -16,19 +16,12 @@ ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_CACHE_FILES = {
     "source_ids.txt",
     "source_embeddings_l2.npy",
-    "source_density.npy",
-    "cluster_subject_labels.npy",
     "reliability_P.npy",
     "reliability_G.npy",
     "reliability_M.npy",
     "reliability_spec.json",
     "influence.npy",
     "late_influence.npy",
-    "distribution_match.npy",
-    "density_score.npy",
-    "facility_align.npy",
-    "target_coverage_order.txt",
-    "query_similarity.npy",
     "manifest.json",
 }
 
@@ -68,8 +61,9 @@ def validate_cache(targets: list[str], budget: int) -> None:
         missing = sorted(REQUIRED_CACHE_FILES - {path.name for path in cache_dir.iterdir() if path.is_file()})
         if missing:
             raise FileNotFoundError(f"{target}: missing cache files: {', '.join(missing)}")
-        arrays = selector.load_arrays(ROOT / "cache", target)
-        source_count = len(arrays["source_ids"])
+        source_ids = read_ids(cache_dir / "source_ids.txt")
+        source_count = len(source_ids)
+        selector.compute_reliability(cache_dir, source_count)
         if source_count < budget:
             raise ValueError(f"{target}: source cache too small for budget {budget}: {source_count}")
         print(f"cache ok: {target} source_count={source_count}")

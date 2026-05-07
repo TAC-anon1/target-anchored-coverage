@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from sklearn.cluster import KMeans
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -27,6 +28,7 @@ from select_tac_sources import (
     compute_diagnostics,
     load_arrays,
     load_config,
+    load_target_support,
     select_tac,
     signal_mean_table,
     write_summary,
@@ -98,18 +100,21 @@ def load_target_state(split_source_root: Path, target: str) -> dict[str, Any]:
         values = np.load(path).astype(np.float32).reshape(-1)
         if values.shape[0] != len(ids):
             raise ValueError(f"{target}: {filename} length {values.shape[0]} != {len(ids)}")
-        return normalize(values)
+        return values
 
-    uncertainty = required_score("target_uncertainty.npy")
-    fg_score = required_score("target_subject_fg_score.npy")
-    lada_score = required_score("lada_li_scores.npy")
+    uncertainty_raw = required_score("target_uncertainty.npy")
+    fg_score_raw = required_score("target_subject_fg_score.npy")
+    lada_score_raw = required_score("lada_li_scores.npy")
+    consistency_raw = required_score("target_consistency.npy")
     return {
         "root": root,
         "ids": ids,
         "vectors": vectors,
-        "uncertainty": uncertainty,
-        "fg_score": fg_score,
-        "lada_score": lada_score,
+        "uncertainty": normalize(uncertainty_raw),
+        "fg_score": normalize(fg_score_raw),
+        "lada_score": normalize(lada_score_raw),
+        "consistency": normalize(consistency_raw),
+        "uncertainty_fg": normalize(uncertainty_raw * fg_score_raw),
     }
 
 
@@ -129,6 +134,60 @@ def greedy_kcenter(ids: list[str], vectors: np.ndarray, budget: int, priority: n
         selected.append(idx)
         min_distance = np.minimum(min_distance, 1.0 - np.maximum(vectors @ vectors[idx], -1.0))
     return [ids[idx] for idx in selected]
+
+
+def weighted_kmeans_select(
+    ids: list[str],
+    vectors: np.ndarray,
+    weights: np.ndarray,
+    budget: int,
+    seed: int = 2025,
+) -> list[str]:
+    if budget <= 0:
+        raise ValueError(f"budget must be positive, got {budget}")
+    if budget > len(ids):
+        raise ValueError(f"budget {budget} exceeds pool size {len(ids)}")
+    vectors = l2_normalize(vectors)
+    weights = np.maximum(np.asarray(weights, dtype=np.float32).reshape(-1), 1e-6)
+    if weights.shape[0] != len(ids):
+        raise ValueError(f"weights length {weights.shape[0]} != ids length {len(ids)}")
+
+    kmeans = KMeans(
+        n_clusters=int(budget),
+        init="k-means++",
+        n_init=10,
+        max_iter=300,
+        random_state=int(seed),
+    )
+    kmeans.fit(vectors, sample_weight=weights)
+    centers = kmeans.cluster_centers_.astype(np.float32)
+    weight_term = normalize(weights)
+
+    selected: list[int] = []
+    used: set[int] = set()
+    for cluster_idx in range(int(budget)):
+        distances = np.linalg.norm(vectors - centers[cluster_idx], axis=1)
+        distance_term = 1.0 - normalize(distances)
+        priority = 0.7 * distance_term + 0.3 * weight_term
+        order = np.argsort(-priority, kind="mergesort")
+        for idx_value in order:
+            idx = int(idx_value)
+            if idx in used or int(kmeans.labels_[idx]) != cluster_idx:
+                continue
+            selected.append(idx)
+            used.add(idx)
+            break
+
+    if len(selected) < int(budget):
+        for idx_value in np.argsort(-weights, kind="mergesort"):
+            idx = int(idx_value)
+            if idx in used:
+                continue
+            selected.append(idx)
+            used.add(idx)
+            if len(selected) == int(budget):
+                break
+    return [ids[idx] for idx in selected[: int(budget)]]
 
 
 def generate_target_eval(split_source_root: Path, target: str) -> None:
@@ -163,8 +222,8 @@ def generate_target_split(split_source_root: Path, target: str, method: str) -> 
         priority = state["uncertainty"] + 0.50 * state["fg_score"]
         selected = greedy_kcenter(ids, vectors, 10, priority=priority)
     elif method == "tac":
-        priority = state["uncertainty"] + 0.25 * state["fg_score"]
-        selected = greedy_kcenter(ids, vectors, 10, priority=priority)
+        weights = state["uncertainty_fg"] + 0.50 * state["lada_score"] + 0.15 * state["consistency"]
+        selected = weighted_kmeans_select(ids, vectors, weights, 10, seed=2025)
     else:
         raise KeyError(method)
     write_ids(dst, selected)
@@ -232,9 +291,10 @@ def generate_orient_source_split(split_source_root: Path, target: str, target_me
     )
 
 
-def generate_tac_source_split(target: str, budget: int, selector_config: Path) -> dict[str, Any]:
+def generate_tac_source_split(target: str, budget: int, selector_config: Path, split_source_root: Path) -> dict[str, Any]:
     config = load_config(selector_config, budget)
-    arrays = load_arrays(ROOT / "cache", target)
+    target_support = load_target_support(split_source_root, ROOT / "data/target_splits", target)
+    arrays = load_arrays(ROOT / "cache", target, config=config, target_support=target_support)
     diagnostics = compute_diagnostics(arrays, config)
     selected, score, tac_diagnostics = select_tac(arrays, diagnostics, config)
     if len(selected) != budget:
@@ -293,7 +353,7 @@ def main() -> None:
             for budget in args.budgets:
                 generate_baseline_source_split(target, method, budget)
         for budget in args.budgets:
-            tac_rows_by_budget[budget].append(generate_tac_source_split(target, budget, selector_config))
+            tac_rows_by_budget[budget].append(generate_tac_source_split(target, budget, selector_config, split_source_root))
             for target_method in orient_target_methods:
                 generate_orient_source_split(split_source_root, target, target_method, budget)
 
