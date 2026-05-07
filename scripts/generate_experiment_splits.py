@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Generate all reviewer-facing source and target splits from reproducible inputs.
+"""Generate all reviewer-facing target and source splits from reproducible inputs.
 
 This script does not import prebuilt experiment split folders. It constructs the
 target-acquisition splits, baseline source splits, ORIENT-style source splits,
-and TAC source splits from subject lists, embeddings, and score arrays.
+and TAC source-target curation splits from subject lists, embeddings, and score
+arrays.
 """
 
 from __future__ import annotations

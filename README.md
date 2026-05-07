@@ -1,18 +1,23 @@
-# TAC Submission Package
+# TAC: Target-Anchored Coverage for Source–Target Curation in Cross-Center Medical Image Segmentation
 
-This folder contains the reviewer-facing non-reference experiment code path for
-the four BraTS target centers, including TAC. It excludes batch-submission files
-and reference reconstruction scripts. The default workflow regenerates split
-files and training configs from reproducible inputs; generated artifacts are not
-part of the clean source package.
+This folder contains the reviewer-facing code for TAC, a joint target
+acquisition and source curation method for the four BraTS target centers. It
+excludes batch-submission files and reference reconstruction scripts. The
+default workflow regenerates target splits, source splits, and training configs
+from reproducible inputs; generated artifacts are not part of the clean source
+package.
+
+TAC is not only a source selector. It first selects a small target support set
+from the unlabeled target pool, then uses that target anchor to curate a compact
+labeled source subset through one deterministic source–target curation rule.
 
 ## Layout
 
-- `cache/<target>/`: selection-time signal arrays used by TAC source selection.
+- `cache/<target>/`: selection-time signal arrays used by TAC source curation.
 - `configs/tac_selector.json`: selector constants used for every target.
 - `configs/targets.json`: package-relative TAC target support/eval locations.
-- `scripts/generate_experiment_splits.py`: regenerates target/source splits.
-- `scripts/select_tac_sources.py`: deterministic TAC source selector.
+- `scripts/generate_experiment_splits.py`: regenerates TAC and baseline target/source splits.
+- `scripts/select_tac_sources.py`: deterministic TAC source-curation stage.
 - `scripts/build_tac_training_configs.py`: EfficientVit config generator.
 - `scripts/build_experiment_configs.py`: builds the full non-reference method
   grid, including TAC.
@@ -94,7 +99,7 @@ results/
 
 ## TAC-Only Generation
 
-If you only need TAC source selections:
+If you only need TAC source–target curation artifacts:
 
 ```bash
 python scripts/generate_experiment_splits.py --budgets 150
@@ -102,11 +107,12 @@ python scripts/build_tac_training_configs.py --budget 150
 python scripts/validate_tac_package.py --budget 150 --require-generated
 ```
 
-TAC outputs are written to:
+TAC target and source outputs are written to:
 
 ```text
+data/target_splits/<target>/tac_10/train_subjects.txt
 data/source_splits/<target>/tac_150/train_subjects.txt
-results/source_selection/b150/TAC_SELECTION_SUMMARY.md
+results/source_selection/b150/TAC_SOURCE_TARGET_CURATION_SUMMARY.md
 ```
 
 ## Local Training

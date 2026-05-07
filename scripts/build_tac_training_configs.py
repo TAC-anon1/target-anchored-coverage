@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build EfficientVit training configs for TAC source selections."""
+"""Build EfficientVit training configs for TAC source-target curation outputs."""
 
 from __future__ import annotations
 

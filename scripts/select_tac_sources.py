@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Generate TAC source selections from frozen selection-time caches.
+"""Generate the TAC source-curation stage from frozen selection-time caches.
 
-TAC is a single target-conditioned selector. It does not branch on target name,
-does not use downstream Dice, and does not use reference subset membership.
+TAC means Target-Anchored Coverage for Source-Target Curation. The full TAC
+pipeline first selects a target support set, then uses that support as the
+anchor for source curation. This script implements the deterministic
+source-curation stage. It does not branch on target name, does not use
+downstream Dice, and does not use reference subset membership.
 """
 
 from __future__ import annotations
@@ -461,9 +464,11 @@ def write_summary(rows: list[dict[str, Any]], results_root: Path, config: TACCon
     results_root.mkdir(parents=True, exist_ok=True)
     (results_root / "summary.json").write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     lines = [
-        "# TAC Source Selection Summary",
+        "# TAC Source-Target Curation Summary",
         "",
-        "TAC uses one continuous target-conditioned objective for every target.",
+        "TAC is Target-Anchored Coverage for Source-Target Curation.",
+        "",
+        "The full pipeline selects a target support set and then applies one continuous target-conditioned source-curation objective for every target.",
         "",
         "## Config",
         "",
@@ -490,12 +495,18 @@ def write_summary(rows: list[dict[str, Any]], results_root: Path, config: TACCon
         "",
         "## Notes",
         "",
-        "- The selector reads only frozen target-conditioned signal caches.",
-        "- The selector does not read target identity-specific reference splits, validation Dice, or test Dice.",
+        "- The source-curation stage reads only frozen target-conditioned signal caches.",
+        "- The source-curation stage does not read target identity-specific reference splits, validation Dice, or test Dice.",
         "- Output source subsets are written under `data/source_splits/<target>/tac_<budget>/`.",
         "",
     ])
-    (results_root / "TAC_SELECTION_SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    summary_path = results_root / "TAC_SOURCE_TARGET_CURATION_SUMMARY.md"
+    summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (results_root / "TAC_SELECTION_SUMMARY.md").write_text(
+        "This file is retained as a compatibility pointer.\n"
+        f"See `{summary_path.name}` for the TAC source-target curation summary.\n",
+        encoding="utf-8",
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -539,7 +550,7 @@ def main() -> None:
     write_summary(rows, results_root, config)
     for row in rows:
         print(f"{row['target']}: selected {row['selected_total']} -> {row['source_split']}")
-    print(results_root / "TAC_SELECTION_SUMMARY.md")
+    print(results_root / "TAC_SOURCE_TARGET_CURATION_SUMMARY.md")
 
 
 if __name__ == "__main__":
