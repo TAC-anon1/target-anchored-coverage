@@ -19,6 +19,7 @@ from typing import Any
 
 import numpy as np
 from sklearn.cluster import KMeans
+from sklearn.linear_model import LogisticRegression
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -102,14 +103,29 @@ def load_target_state(split_source_root: Path, target: str) -> dict[str, Any]:
             raise ValueError(f"{target}: {filename} length {values.shape[0]} != {len(ids)}")
         return values
 
+    def optional_score(filename: str) -> np.ndarray | None:
+        path = root / filename
+        if not path.exists():
+            return None
+        values = np.load(path).astype(np.float32).reshape(-1)
+        if values.shape[0] != len(ids):
+            raise ValueError(f"{target}: {filename} length {values.shape[0]} != {len(ids)}")
+        return values
+
     uncertainty_raw = required_score("target_uncertainty.npy")
     fg_score_raw = required_score("target_subject_fg_score.npy")
     lada_score_raw = required_score("lada_li_scores.npy")
     consistency_raw = required_score("target_consistency.npy")
+    aada_score_raw = optional_score("aada_importance_scores.npy")
     return {
         "root": root,
         "ids": ids,
         "vectors": vectors,
+        "uncertainty_raw": uncertainty_raw,
+        "fg_score_raw": fg_score_raw,
+        "lada_score_raw": lada_score_raw,
+        "consistency_raw": consistency_raw,
+        "aada_score_raw": aada_score_raw,
         "uncertainty": normalize(uncertainty_raw),
         "fg_score": normalize(fg_score_raw),
         "lada_score": normalize(lada_score_raw),
@@ -190,6 +206,124 @@ def weighted_kmeans_select(
     return [ids[idx] for idx in selected[: int(budget)]]
 
 
+def clue_select(ids: list[str], vectors: np.ndarray, entropies: np.ndarray, budget: int, seed: int = 0) -> list[str]:
+    if budget <= 0:
+        raise ValueError(f"budget must be positive, got {budget}")
+    if budget > len(ids):
+        raise ValueError(f"budget {budget} exceeds pool size {len(ids)}")
+    vectors = l2_normalize(vectors)
+    weights = np.maximum(np.asarray(entropies, dtype=np.float32).reshape(-1), 1e-8)
+    if weights.shape[0] != len(ids):
+        raise ValueError(f"entropies length {weights.shape[0]} != ids length {len(ids)}")
+    weights = weights / (weights.sum() + 1e-8) * len(weights)
+    kmeans = KMeans(
+        n_clusters=int(budget),
+        init="k-means++",
+        n_init=10,
+        max_iter=300,
+        random_state=int(seed),
+    )
+    kmeans.fit(vectors, sample_weight=weights)
+    selected: list[int] = []
+    used: set[int] = set()
+    for cluster_idx in range(int(budget)):
+        distances = np.linalg.norm(vectors - kmeans.cluster_centers_[cluster_idx], axis=1)
+        for idx_value in np.argsort(distances, kind="mergesort"):
+            idx = int(idx_value)
+            if idx not in used:
+                selected.append(idx)
+                used.add(idx)
+                break
+    if len(selected) < int(budget):
+        for idx_value in np.argsort(-weights, kind="mergesort"):
+            idx = int(idx_value)
+            if idx in used:
+                continue
+            selected.append(idx)
+            used.add(idx)
+            if len(selected) == int(budget):
+                break
+    return [ids[idx] for idx in selected[: int(budget)]]
+
+
+def lada_select(ids: list[str], vectors: np.ndarray, li_scores: np.ndarray, budget: int, m: int = 10, seed: int = 0) -> list[str]:
+    if budget <= 0:
+        raise ValueError(f"budget must be positive, got {budget}")
+    if budget > len(ids):
+        raise ValueError(f"budget {budget} exceeds pool size {len(ids)}")
+    vectors = l2_normalize(vectors)
+    li_scores = np.asarray(li_scores, dtype=np.float32).reshape(-1)
+    if li_scores.shape[0] != len(ids):
+        raise ValueError(f"LI score length {li_scores.shape[0]} != ids length {len(ids)}")
+    candidate_count = min((1 + int(m)) * int(budget), len(ids))
+    candidate_indices = np.argsort(li_scores, kind="mergesort")[-candidate_count:]
+    candidate_vectors = vectors[candidate_indices]
+    kmeans = KMeans(
+        n_clusters=int(budget),
+        init="k-means++",
+        n_init=10,
+        max_iter=300,
+        random_state=int(seed),
+    )
+    kmeans.fit(candidate_vectors)
+    selected: list[int] = []
+    used_candidates: set[int] = set()
+    for cluster_idx in range(int(budget)):
+        distances = np.linalg.norm(candidate_vectors - kmeans.cluster_centers_[cluster_idx], axis=1)
+        for candidate_pos_value in np.argsort(distances, kind="mergesort"):
+            candidate_pos = int(candidate_pos_value)
+            if candidate_pos not in used_candidates:
+                selected.append(int(candidate_indices[candidate_pos]))
+                used_candidates.add(candidate_pos)
+                break
+    if len(selected) < int(budget):
+        used = set(selected)
+        for idx_value in np.argsort(-li_scores, kind="mergesort"):
+            idx = int(idx_value)
+            if idx in used:
+                continue
+            selected.append(idx)
+            used.add(idx)
+            if len(selected) == int(budget):
+                break
+    return [ids[idx] for idx in selected[: int(budget)]]
+
+
+def aada_select(ids: list[str], target_vectors: np.ndarray, source_vectors_in: np.ndarray, uncertainty: np.ndarray, budget: int, seed: int = 0) -> list[str]:
+    if budget <= 0:
+        raise ValueError(f"budget must be positive, got {budget}")
+    if budget > len(ids):
+        raise ValueError(f"budget {budget} exceeds pool size {len(ids)}")
+    target_vectors = l2_normalize(target_vectors)
+    source_vectors_in = l2_normalize(source_vectors_in)
+    uncertainty = np.asarray(uncertainty, dtype=np.float32).reshape(-1)
+    if uncertainty.shape[0] != len(ids):
+        raise ValueError(f"uncertainty length {uncertainty.shape[0]} != ids length {len(ids)}")
+    domain_vectors = np.concatenate([source_vectors_in, target_vectors], axis=0)
+    domain_labels = np.concatenate(
+        [
+            np.ones(source_vectors_in.shape[0], dtype=np.int64),
+            np.zeros(target_vectors.shape[0], dtype=np.int64),
+        ],
+        axis=0,
+    )
+    classifier = LogisticRegression(
+        solver="liblinear",
+        class_weight="balanced",
+        max_iter=1000,
+        random_state=int(seed),
+    )
+    classifier.fit(domain_vectors, domain_labels)
+    class_to_column = {int(label): idx for idx, label in enumerate(classifier.classes_)}
+    source_column = class_to_column[1]
+    source_prob = classifier.predict_proba(target_vectors)[:, source_column]
+    source_prob = np.clip(source_prob, 1e-6, 1.0 - 1e-6)
+    diversity = (1.0 - source_prob) / source_prob
+    score = diversity * np.maximum(uncertainty, 1e-8)
+    selected = np.argsort(-score, kind="mergesort")[: int(budget)]
+    return [ids[int(idx)] for idx in selected]
+
+
 def generate_target_eval(split_source_root: Path, target: str) -> None:
     root = active_dir(split_source_root, target)
     dst = ROOT / "data/target_splits" / target / "eval"
@@ -210,17 +344,14 @@ def generate_target_split(split_source_root: Path, target: str, method: str) -> 
     elif method == "coreset":
         selected = greedy_kcenter(ids, vectors, 10)
     elif method == "lada":
-        score = state["uncertainty"] + 0.50 * state["fg_score"] + state["lada_score"]
-        selected = [ids[idx] for idx in np.argsort(-score, kind="mergesort")[:10]]
+        selected = lada_select(ids, vectors, state["lada_score_raw"], 10, m=10, seed=0)
     elif method == "aada":
-        source_vectors = l2_normalize(np.load(ROOT / "cache" / target / "source_embeddings_l2.npy"))
-        source_centroid = l2_normalize(source_vectors.mean(axis=0, keepdims=True))[0]
-        target_domainness = normalize(1.0 - np.maximum(vectors @ source_centroid, -1.0))
-        score = target_domainness + 0.50 * state["uncertainty"] + 0.25 * state["fg_score"]
-        selected = [ids[idx] for idx in np.argsort(-score, kind="mergesort")[:10]]
+        if state["aada_score_raw"] is None:
+            selected = aada_select(ids, vectors, source_vectors(target), state["uncertainty_raw"], 10, seed=0)
+        else:
+            selected = [ids[idx] for idx in np.argsort(-state["aada_score_raw"], kind="mergesort")[:10]]
     elif method == "ada_clue":
-        priority = state["uncertainty"] + 0.50 * state["fg_score"]
-        selected = greedy_kcenter(ids, vectors, 10, priority=priority)
+        selected = clue_select(ids, vectors, state["uncertainty_raw"], 10, seed=0)
     elif method == "tac":
         weights = state["uncertainty_fg"] + 0.50 * state["lada_score"] + 0.15 * state["consistency"]
         selected = weighted_kmeans_select(ids, vectors, weights, 10, seed=2025)

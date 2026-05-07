@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import tempfile
@@ -143,7 +144,10 @@ def load_model(modules: ImportedEfficientVit, checkpoint: Path, device: Any) -> 
         pretrained=False,
     ).to(device)
     state = torch.load(str(checkpoint), map_location=device)
-    model_state = state["model_state"] if isinstance(state, dict) and "model_state" in state else state
+    if isinstance(state, dict):
+        model_state = state.get("model_state_dict", state.get("model_state", state))
+    else:
+        model_state = state
     model.load_state_dict(model_state, strict=False)
     model.eval()
     return model
@@ -174,6 +178,231 @@ def build_loader(
         shuffle=bool(shuffle),
         num_workers=int(num_workers),
         drop_last=False,
+    )
+
+
+def build_training_loader(
+    modules: ImportedEfficientVit,
+    data_root: Path,
+    split_txt_dir: Path,
+    img_size: int,
+    batch_size: int,
+    num_workers: int,
+    skip_empty: bool,
+    shuffle: bool,
+    drop_last: bool,
+) -> Any:
+    dataset = modules.dataset_cls(
+        root_dir=str(data_root),
+        split="train",
+        img_size=int(img_size),
+        split_txt_dir=str(split_txt_dir),
+        skip_empty=bool(skip_empty),
+    )
+    dataset.return_meta = False
+    return modules.data_loader_cls(
+        dataset,
+        batch_size=int(batch_size),
+        shuffle=bool(shuffle),
+        num_workers=int(num_workers),
+        drop_last=bool(drop_last),
+        pin_memory=True,
+    )
+
+
+def extract_backbone_features(model: Any, images: Any) -> Any:
+    features = model.model.backbone(images)
+    if isinstance(features, dict):
+        features = list(features.values())[-1]
+    return features
+
+
+def decode_features(model: Any, features: Any, spatial_shape: tuple[int, int]) -> Any:
+    output = model.decoder(features)
+    output = model.final_head(output)
+    if output.shape[2:] != spatial_shape:
+        import torch.nn.functional as F
+
+        output = F.interpolate(output, size=spatial_shape, mode="bilinear", align_corners=False)
+    return output
+
+
+def pixel_entropy(torch: Any, logits: Any) -> Any:
+    probabilities = torch.softmax(logits, dim=1)
+    log_probabilities = torch.log_softmax(logits, dim=1)
+    return -(probabilities * log_probabilities).sum(dim=1).mean(dim=(1, 2))
+
+
+def infinite_iter(loader: Any) -> Iterable[Any]:
+    while True:
+        for batch in loader:
+            yield batch
+
+
+def build_domain_discriminator(torch: Any, channels: int, hidden_dim: int) -> Any:
+    class GradientReversalFn(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx: Any, values: Any, alpha: float) -> Any:
+            ctx.alpha = alpha
+            return values.view_as(values)
+
+        @staticmethod
+        def backward(ctx: Any, grad_output: Any) -> tuple[Any, None]:
+            return grad_output.neg() * ctx.alpha, None
+
+    class DomainDiscriminator(torch.nn.Module):
+        def __init__(self, in_channels: int, hidden_dim: int) -> None:
+            super().__init__()
+            self.pool = torch.nn.AdaptiveAvgPool2d(1)
+            self.classifier = torch.nn.Sequential(
+                torch.nn.Linear(in_channels, hidden_dim),
+                torch.nn.ReLU(inplace=True),
+                torch.nn.Dropout(0.5),
+                torch.nn.Linear(hidden_dim, 1),
+            )
+
+        def forward(self, features: Any, alpha: float = 1.0) -> Any:
+            values = GradientReversalFn.apply(features, alpha)
+            values = self.pool(values).flatten(1)
+            return self.classifier(values)
+
+        def predict_source_prob(self, features: Any) -> Any:
+            with torch.no_grad():
+                values = self.pool(features).flatten(1)
+                return torch.sigmoid(self.classifier(values)).squeeze(1)
+
+    return DomainDiscriminator(int(channels), int(hidden_dim))
+
+
+def compute_aada_importance_scores(
+    modules: ImportedEfficientVit,
+    model: Any,
+    data_root: Path,
+    source_split: Path,
+    target_split: Path,
+    img_size: int,
+    batch_size: int,
+    num_workers: int,
+    source_skip_empty: bool,
+    target_skip_empty: bool,
+    device: Any,
+    epochs: int,
+    steps_per_epoch: int,
+    learning_rate: float,
+    lambda_dann: float,
+    hidden_dim: int,
+    top_ratio: float,
+    entropy_weight: float,
+    min_slices: int,
+) -> dict[str, Any]:
+    torch = modules.torch
+    source_loader = build_training_loader(
+        modules,
+        data_root,
+        source_split,
+        img_size,
+        batch_size,
+        num_workers,
+        skip_empty=source_skip_empty,
+        shuffle=True,
+        drop_last=True,
+    )
+    target_loader = build_training_loader(
+        modules,
+        data_root,
+        target_split,
+        img_size,
+        batch_size,
+        num_workers,
+        skip_empty=target_skip_empty,
+        shuffle=True,
+        drop_last=True,
+    )
+    probe_images = next(iter(source_loader))[0].to(device)
+    with torch.no_grad():
+        probe_features = extract_backbone_features(model, probe_images)
+    discriminator = build_domain_discriminator(torch, int(probe_features.shape[1]), int(hidden_dim)).to(device)
+    seg_criterion = modules.loss_cls()
+    domain_criterion = torch.nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.AdamW(
+        list(model.parameters()) + list(discriminator.parameters()),
+        lr=float(learning_rate),
+        weight_decay=1e-5,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(int(epochs), 1), eta_min=1e-6)
+    source_iter = infinite_iter(source_loader)
+    target_iter = infinite_iter(target_loader)
+    for epoch in range(int(epochs)):
+        model.train()
+        discriminator.train()
+        progress = epoch / max(int(epochs), 1)
+        alpha = float(lambda_dann) * (2.0 / (1.0 + math.exp(-10.0 * progress)) - 1.0)
+        for _ in tqdm(range(int(steps_per_epoch)), desc=f"AADA DANN {epoch + 1}/{epochs}", ncols=100):
+            source_batch = next(source_iter)
+            target_batch = next(target_iter)
+            source_images = source_batch[0].to(device)
+            source_labels = source_batch[1].to(device)
+            target_images = target_batch[0].to(device)
+            optimizer.zero_grad(set_to_none=True)
+            source_features = extract_backbone_features(model, source_images)
+            source_logits = decode_features(model, source_features, source_images.shape[2:])
+            seg_loss = seg_criterion(source_logits, source_labels)
+            source_domain = discriminator(source_features, alpha)
+            target_features = extract_backbone_features(model, target_images)
+            target_domain = discriminator(target_features, alpha)
+            domain_loss = domain_criterion(source_domain, torch.ones_like(source_domain)) + domain_criterion(target_domain, torch.zeros_like(target_domain))
+            loss = seg_loss + domain_loss
+            loss.backward()
+            optimizer.step()
+        scheduler.step()
+
+    scoring_loader = build_loader(
+        modules,
+        data_root,
+        target_split,
+        img_size,
+        batch_size,
+        num_workers,
+        skip_empty=target_skip_empty,
+        return_meta=True,
+    )
+    model.eval()
+    discriminator.eval()
+    slice_names: list[str] = []
+    slice_scores: list[float] = []
+    slice_diversity: list[float] = []
+    slice_uncertainty: list[float] = []
+    slice_fg: list[float] = []
+    with torch.no_grad():
+        for images, _labels, subject_ids, slice_indices in tqdm(scoring_loader, desc="AADA importance", ncols=100):
+            images = images.to(device)
+            features = extract_backbone_features(model, images)
+            source_prob = discriminator.predict_source_prob(features)
+            diversity = (1.0 - source_prob) / (source_prob + 1e-8)
+            logits = decode_features(model, features, images.shape[2:])
+            uncertainty = pixel_entropy(torch, logits)
+            probabilities = torch.softmax(logits, dim=1)
+            fg_score = probabilities[:, 1:, :, :].sum(dim=1).mean(dim=(1, 2))
+            scores = diversity * uncertainty
+            for idx, subject_id in enumerate(subject_ids):
+                slice_names.append(f"{subject_id}_slice{int(slice_indices[idx].item())}")
+                slice_scores.append(float(scores[idx].item()))
+                slice_diversity.append(float(diversity[idx].item()))
+                slice_uncertainty.append(float(uncertainty[idx].item()))
+                slice_fg.append(float(fg_score[idx].item()))
+    uncertainty_array = np.asarray(slice_uncertainty, dtype=np.float32)
+    fg_array = np.asarray(slice_fg, dtype=np.float32)
+    ranking = fg_array + float(entropy_weight) * uncertainty_array
+    return aggregate_subject_arrays(
+        slice_names=slice_names,
+        arrays={
+            "score": np.asarray(slice_scores, dtype=np.float32),
+            "diversity": np.asarray(slice_diversity, dtype=np.float32),
+            "uncertainty": uncertainty_array,
+        },
+        ranking_score=ranking,
+        top_ratio=top_ratio,
+        min_slices=min_slices,
     )
 
 
@@ -852,6 +1081,38 @@ def prepare_one_target(args: argparse.Namespace, modules: ImportedEfficientVit, 
     write_ids(target_cache_dir / "source_ids.txt", source_state["subject_ids"])
     np.save(target_cache_dir / "source_embeddings_l2.npy", source_state["subject_embeddings_l2"])
 
+    if not args.skip_aada_score:
+        print(f"[{target}] computing AADA DANN target scores")
+        aada_model = load_model(modules, args.warmup_checkpoint.expanduser().resolve(), device)
+        aada_state = compute_aada_importance_scores(
+            modules,
+            aada_model,
+            data_root,
+            source_split,
+            active_split,
+            args.img_size,
+            args.batch_size,
+            args.num_workers,
+            args.source_skip_empty,
+            args.target_skip_empty,
+            device,
+            args.aada_epochs,
+            args.aada_steps_per_epoch,
+            args.aada_lr,
+            args.aada_lambda_dann,
+            args.aada_hidden_dim,
+            args.subject_top_ratio,
+            args.subject_entropy_weight,
+            args.subject_min_slices,
+        )
+        aada_positions = {subject_id: idx for idx, subject_id in enumerate(aada_state["subject_ids"])}
+        missing_aada = [subject_id for subject_id in target_state["subject_ids"] if subject_id not in aada_positions]
+        if missing_aada:
+            raise ValueError(f"{target}: AADA scores missing target subjects: {missing_aada[:5]}")
+        aada_order = np.asarray([aada_positions[subject_id] for subject_id in target_state["subject_ids"]], dtype=np.int64)
+        np.save(target_selection_dir / "aada_importance_scores.npy", aada_state["aggregated"]["score"][aada_order].astype(np.float32))
+        np.save(target_selection_dir / "aada_diversity.npy", aada_state["aggregated"]["diversity"][aada_order].astype(np.float32))
+
     target_weights_all = target_acquisition_weights(target_state)
     target_support_ids = weighted_kmeans_support(
         target_state["subject_ids"],
@@ -946,6 +1207,7 @@ def prepare_one_target(args: argparse.Namespace, modules: ImportedEfficientVit, 
                 "target_budget": int(args.target_budget),
                 "warmup_checkpoint": str(args.warmup_checkpoint),
                 "gradient_checkpoints": [str(path) for path in args.gradient_checkpoints],
+                "aada_score_file": None if args.skip_aada_score else str(target_selection_dir / "aada_importance_scores.npy"),
                 "selection_input_dir": str(target_selection_dir),
                 "cache_dir": str(target_cache_dir),
             },
@@ -996,6 +1258,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--consistency-views", type=int, default=3)
     parser.add_argument("--consistency-jitter", type=float, default=0.15)
     parser.add_argument("--consistency-noise", type=float, default=0.03)
+    parser.add_argument("--skip-aada-score", action="store_true", help="Skip DANN-based AADA target-score generation.")
+    parser.add_argument("--aada-epochs", type=int, default=10)
+    parser.add_argument("--aada-steps-per-epoch", type=int, default=500)
+    parser.add_argument("--aada-lr", type=float, default=1e-4)
+    parser.add_argument("--aada-lambda-dann", type=float, default=0.1)
+    parser.add_argument("--aada-hidden-dim", type=int, default=256)
     parser.add_argument("--match-topk", type=int, default=8)
     parser.add_argument("--reliability-temperature", type=float, default=1.0)
     parser.add_argument("--reliability-topk", type=int, default=150)
