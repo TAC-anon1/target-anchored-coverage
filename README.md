@@ -14,9 +14,12 @@ through one deterministic source–target curation rule.
 
 ## Layout
 
-- `cache/<target>/`: primitive source-side arrays used by TAC source curation.
+- `cache/<target>/`: generated TAC selection cache, produced from raw slices
+  and checkpoints by `scripts/prepare_tac_inputs.py`.
 - `configs/tac_selector.json`: selector constants used for every target.
 - `configs/targets.json`: package-relative TAC target support/eval locations.
+- `scripts/prepare_tac_inputs.py`: extracts selection-time embeddings, target
+  scores, P/G/M reliability primitives, and gradient influence from raw data.
 - `scripts/generate_experiment_splits.py`: regenerates TAC and baseline target/source splits.
 - `scripts/select_tac_sources.py`: deterministic TAC source-curation stage.
 - `scripts/build_tac_training_configs.py`: EfficientVit config generator.
@@ -29,7 +32,8 @@ through one deterministic source–target curation rule.
 
 Requires Python 3.10+, NumPy, PyYAML, and scikit-learn for split/config
 generation and validation. Training additionally requires PyTorch and the
-external EfficientVit codebase.
+external EfficientVit codebase. Raw TAC input preparation additionally requires
+PyTorch and the dependencies needed by the EfficientVit codebase.
 
 Before running, either create these package-local symlinks:
 
@@ -48,8 +52,10 @@ export SPLIT_SOURCE_ROOT=/path/to/selection_inputs
 ```
 
 `SPLIT_SOURCE_ROOT` provides target candidate lists, validation/test lists, and
-target embedding/score arrays. The package writes generated splits/configs under
-this folder only, never under `SPLIT_SOURCE_ROOT`.
+target embedding/score arrays. These files can be generated from raw BraTS
+slices and EfficientViT checkpoints with `scripts/prepare_tac_inputs.py`.
+The package writes generated splits/configs under this folder only, never under
+`SPLIT_SOURCE_ROOT`.
 
 Expected `selection_inputs` layout:
 
@@ -71,11 +77,51 @@ selection_inputs/
 
 Each target directory follows the same file layout.
 
+## Raw TAC Input Preparation
+
+The clean reviewer path does not require prebuilt TAC reliability or influence
+scores. Generate them from raw BraTS slices, official split files, and warmup
+checkpoints before building experiment splits:
+
+```bash
+python scripts/prepare_tac_inputs.py \
+  --efficientvit-root "$EFFICIENTVIT_ROOT" \
+  --data-root "$BRATS_DATA_ROOT" \
+  --split-root "$EFFICIENTVIT_ROOT/data" \
+  --warmup-checkpoint /path/to/warmup/epoch_020.pt \
+  --gradient-checkpoints /path/to/warmup/epoch_010.pt /path/to/warmup/epoch_015.pt /path/to/warmup/epoch_020.pt \
+  --targets all
+```
+
+This writes:
+
+```text
+external/selection_inputs/split_<target>_active/
+cache/<target>/
+```
+
+The script computes:
+
+- subject embeddings from the frozen EfficientViT warmup model;
+- target acquisition scores from foreground-aware entropy, local inconsistency,
+  and consistency views;
+- `reliability_P.npy` from target-support morphology prototypes;
+- `reliability_M.npy` from target-support distribution match;
+- `reliability_G.npy`, `influence.npy`, and `late_influence.npy` from
+  final-head gradient agreement at the supplied checkpoints;
+- `reliability_spec.json` from selection-time adaptive P/G/M reliability
+  weights.
+
+No downstream Dice, validation/test metrics, reference subset membership, or
+legacy subset membership is read by this preparation script.
+
 ## One-Command Preparation
 
 From this folder:
 
 ```bash
+# Run scripts/prepare_tac_inputs.py first if cache/<target>/ and
+# external/selection_inputs/ have not already been generated from raw data.
 python scripts/generate_experiment_splits.py --budgets 50 100 150 200
 for b in 50 100 150 200; do
   python scripts/build_tac_training_configs.py --budget "$b"
@@ -117,8 +163,8 @@ data/source_splits/<target>/tac_150/train_subjects.txt
 results/source_selection/b150/TAC_SOURCE_TARGET_CURATION_SUMMARY.md
 ```
 
-TAC recomputes the reliability utility from cached P/G/M-style primitive
-components and fixed selection-time weights in `cache/<target>/reliability_spec.json`;
+TAC recomputes the reliability utility from generated P/G/M primitive
+components and selection-time weights in `cache/<target>/reliability_spec.json`;
 it does not load a precomputed reliability scalar. TAC also recomputes source
 density, source clusters, source--target query similarity, distribution match,
 target-anchored facility coverage, and facility alignment from source embeddings
@@ -183,13 +229,17 @@ configs/experiments/b<budget>/
 
 ## Generated Artifact Policy
 
-The clean source package should contain code, configs, and cache primitives only.
-Generated split files, training configs, results, logs, and outputs are ignored
+The clean source package should contain code and configs only. TAC cache files,
+generated split files, training configs, results, logs, and outputs are ignored
 by `.gitignore` and can be regenerated with:
 
 ```bash
-rm -rf data/source_splits configs/generated configs/experiments results logs outputs
+rm -rf cache/* data/source_splits configs/generated configs/experiments results logs outputs
 find data/target_splits -mindepth 1 ! -name README.md -exec rm -rf {} +
+python scripts/prepare_tac_inputs.py \
+  --warmup-checkpoint /path/to/warmup/epoch_020.pt \
+  --gradient-checkpoints /path/to/warmup/epoch_010.pt /path/to/warmup/epoch_015.pt /path/to/warmup/epoch_020.pt \
+  --targets all
 python scripts/generate_experiment_splits.py --budgets 50 100 150 200
 for b in 50 100 150 200; do
   python scripts/build_tac_training_configs.py --budget "$b"

@@ -2,6 +2,11 @@ logs/
 *.log
 *.out
 *.err
+cache/*/
+!cache/README.md
+external/EfficientVit
+external/BraTS2021_preprocessed
+external/selection_inputs
 outputs/
 results/
 configs/generated/
