@@ -7,12 +7,15 @@
     "influence.npy",
     "late_influence.npy",
     "query_similarity.npy",
-    "reliability.npy",
+    "reliability_G.npy",
+    "reliability_M.npy",
+    "reliability_P.npy",
+    "reliability_spec.json",
     "source_density.npy",
     "source_embeddings_l2.npy",
     "source_ids.txt",
     "target_coverage_order.txt"
   ],
-  "note": "TAC cache exported from fixed selection-time primitives; no downstream metric or reference subset membership is included.",
+  "note": "TAC cache exported from fixed selection-time primitives; reliability is recomputed from component scores by scripts/select_tac_sources.py. No downstream metric or reference subset membership is included.",
   "target": "TCGA_GBM"
 }

@@ -100,6 +100,21 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def compute_reliability(cache_dir: Path, expected: int) -> np.ndarray:
+    spec = load_json(cache_dir / "reliability_spec.json")
+    component_files = spec["component_files"]
+    weights = spec["weights"]
+    score = np.zeros(expected, dtype=np.float32)
+    for component in ("P", "G", "M"):
+        values = np.load(cache_dir / component_files[component]).astype(np.float32).reshape(-1)
+        if values.shape[0] != expected:
+            raise ValueError(
+                f"{cache_dir.name}: reliability component {component} has length {values.shape[0]}, expected {expected}"
+            )
+        score += float(weights[component]) * values
+    return normalize(score)
+
+
 def load_config(path: Path, budget: int | None) -> TACConfig:
     values = load_json(path)
     config = TACConfig(**values)
@@ -130,7 +145,7 @@ def load_arrays(cache_root: Path, target: str) -> dict[str, Any]:
     clusters = np.load(cache_dir / "cluster_subject_labels.npy").astype(np.int64)
     query_similarity = np.maximum(np.load(cache_dir / "query_similarity.npy").astype(np.float32), 0.0)
 
-    reliability = normalize(np.load(cache_dir / "reliability.npy").astype(np.float32))
+    reliability = compute_reliability(cache_dir, len(source_ids))
     influence = normalize(np.load(cache_dir / "influence.npy").astype(np.float32))
     late = normalize(np.load(cache_dir / "late_influence.npy").astype(np.float32))
     match = normalize(np.load(cache_dir / "distribution_match.npy").astype(np.float32))

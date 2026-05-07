@@ -13,7 +13,7 @@ labeled source subset through one deterministic source–target curation rule.
 
 ## Layout
 
-- `cache/<target>/`: selection-time signal arrays used by TAC source curation.
+- `cache/<target>/`: selection-time primitive arrays used by TAC source curation.
 - `configs/tac_selector.json`: selector constants used for every target.
 - `configs/targets.json`: package-relative TAC target support/eval locations.
 - `scripts/generate_experiment_splits.py`: regenerates TAC and baseline target/source splits.
@@ -114,6 +114,10 @@ data/target_splits/<target>/tac_10/train_subjects.txt
 data/source_splits/<target>/tac_150/train_subjects.txt
 results/source_selection/b150/TAC_SOURCE_TARGET_CURATION_SUMMARY.md
 ```
+
+TAC recomputes the reliability utility from cached P/G/M-style primitive
+components and fixed selection-time weights in `cache/<target>/reliability_spec.json`;
+it does not load a precomputed reliability scalar.
 
 ## Local Training
 

@@ -1,0 +1,16 @@
+{
+  "component_files": {
+    "G": "reliability_G.npy",
+    "M": "reliability_M.npy",
+    "P": "reliability_P.npy"
+  },
+  "mode": "fixed_target_anchor_reliability",
+  "normalization": "minmax after weighted sum",
+  "note": "Weights are fixed selection-time target-anchor reliability weights and are not fit to downstream Dice or selected subset membership.",
+  "rule": "R = minmax(lambda_P * P + lambda_G * G + lambda_M * M)",
+  "weights": {
+    "G": 0.3499999940395355,
+    "M": 0.5,
+    "P": 0.15000000596046448
+  }
+}
